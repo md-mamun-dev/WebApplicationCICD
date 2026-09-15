@@ -1,0 +1,362 @@
+name: ASP.NET Web API CI/CD with backup run on failed deploy
+
+on:
+  push:
+    branches:
+      - master
+
+  workflow_dispatch:
+
+
+# ==================================================
+# GLOBAL VARIABLES
+# ==================================================
+env:
+  BUILD_CONFIGURATION: Release
+
+  ARTIFACT_NAME: WebApi
+
+  APP_POOL_NAME: TestApplicationPool
+
+  IIS_PATH: C:\inetpub\wwwroot\TestApplication
+
+  BACKUP_PATH: C:\Backups\TestApplicationPool
+
+  BACKUP_RETENTION_COUNT: 10
+
+  DEPLOY_PATH: C:\deploy\WebApi
+
+  # Optional. Set to a real health-check route to enable the
+  # post-deploy smoke test. Leave blank to skip it.
+  HEALTH_CHECK_URL: ""
+
+
+# Stops two deploys (e.g. a manual run racing a push) from
+# fighting over the same IIS folder at the same time.
+# concurrency:
+#   group: deploy-aspwebapi6
+#   cancel-in-progress: false
+
+permissions:
+  contents: read
+
+
+jobs:
+
+  # ==================================================
+  # BUILD
+  # ==================================================
+  build:
+    name: Build and Publish Web API
+
+    runs-on: windows-latest
+
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+
+      - name: Find Solution
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $slnx = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.slnx -Recurse |
+            Select-Object -First 1
+
+          if (-not $slnx) {
+              Write-Error "No .slnx file found."
+              exit 1
+          }
+
+          Write-Host "Solution found: $($slnx.FullName)"
+          "SOLUTION=$($slnx.FullName)" >> $env:GITHUB_ENV
+
+
+      - name: Restore NuGet Packages
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          nuget restore "$env:SOLUTION"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "nuget restore failed (exit code $LASTEXITCODE)."
+              exit 1
+          }
+
+
+      - name: Build and Publish
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $publishPath = "$env:GITHUB_WORKSPACE\publish_output"
+
+          if (Test-Path $publishPath) {
+              Remove-Item $publishPath -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $publishPath -Force | Out-Null
+
+          Write-Host "Publishing to: $publishPath"
+
+          msbuild "$env:SOLUTION" `
+            /m `
+            /p:Configuration=$env:BUILD_CONFIGURATION `
+            /p:Platform="Any CPU" `
+            /p:DeployOnBuild=true `
+            /p:DeployDefaultTarget=WebPublish `
+            /p:WebPublishMethod=FileSystem `
+            /p:DeleteExistingFiles=true `
+            /p:publishUrl="$publishPath"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "msbuild failed (exit code $LASTEXITCODE)."
+              exit 1
+          }
+
+          $files = Get-ChildItem -Path $publishPath -Recurse -File
+          if ($files.Count -eq 0) {
+              Write-Error "Publish folder is empty."
+              exit 1
+          }
+          Write-Host "Published files: $($files.Count)"
+
+
+      - name: Upload Web API Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ github.workspace }}/publish_output
+          if-no-files-found: error
+          retention-days: 2
+
+
+  # ==================================================
+  # DEPLOY
+  # ==================================================
+  deploy:
+    name: Deploy to IIS
+
+    needs: build
+
+    runs-on:
+      - self-hosted
+      - Windows
+
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+
+      - name: Download Web API Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.DEPLOY_PATH }}
+
+
+      - name: Verify Artifact
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $files = Get-ChildItem -Path $env:DEPLOY_PATH -Recurse -File
+          if ($files.Count -eq 0) {
+              Write-Error "Artifact folder is empty: $env:DEPLOY_PATH"
+              exit 1
+          }
+          Write-Host "Downloaded files: $($files.Count)"
+
+
+      - name: Stop App Pool
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $pool = Get-WebAppPoolState -Name $env:APP_POOL_NAME -ErrorAction SilentlyContinue
+          if (-not $pool) {
+              Write-Error "App pool '$env:APP_POOL_NAME' was not found."
+              exit 1
+          }
+
+          if ($pool.Value -eq "Started") {
+              Stop-WebAppPool -Name $env:APP_POOL_NAME
+              Start-Sleep -Seconds 3
+              Write-Host "App pool stopped."
+          } else {
+              Write-Host "App pool already stopped."
+          }
+
+
+      # Backs up the current live site before overwriting it, and
+      # remembers the path so "Rollback on Failure" can use it later.
+      - name: Backup Current Application
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path $env:IIS_PATH) {
+              $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+              $backupPath = Join-Path $env:BACKUP_PATH $timestamp
+
+              New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+              Copy-Item -Path "$env:IIS_PATH\*" -Destination $backupPath -Recurse -Force
+
+              Write-Host "Backup created: $backupPath"
+              "BACKUP_SNAPSHOT_PATH=$backupPath" >> $env:GITHUB_ENV
+
+              # Keep only the most recent N backups.
+              $keep = [int]$env:BACKUP_RETENTION_COUNT
+              Get-ChildItem -Path $env:BACKUP_PATH -Directory |
+                Sort-Object Name -Descending |
+                Select-Object -Skip $keep |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          } else {
+              Write-Host "No existing site found - skipping backup."
+          }
+
+
+      # /MIR makes the destination match the source exactly (adds new
+      # files, updates changed ones, deletes stale ones). Robocopy's
+      # exit codes are a bitmask, not a plain 0/1 result: 0-7 all mean
+      # success (e.g. "1" just means files were copied), 8+ means it
+      # actually failed. We reset $LASTEXITCODE to 0 afterwards so
+      # GitHub Actions' own end-of-step check doesn't misread a
+      # successful robocopy run (nonzero code) as a failed step.
+      - name: Deploy Web API
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (!(Test-Path $env:IIS_PATH)) {
+              New-Item -ItemType Directory -Path $env:IIS_PATH -Force | Out-Null
+          }
+
+          robocopy $env:DEPLOY_PATH $env:IIS_PATH /MIR /R:3 /W:5 /NFL /NDL /NP
+          $robocopyExitCode = $LASTEXITCODE
+
+          if ($robocopyExitCode -ge 8) {
+              Write-Error "robocopy failed (exit code $robocopyExitCode)."
+              exit 1
+          }
+
+          $global:LASTEXITCODE = 0
+
+          $files = Get-ChildItem -Path $env:IIS_PATH -Recurse -File
+          if ($files.Count -eq 0) {
+              Write-Error "IIS folder is empty after deploy."
+              exit 1
+          }
+          Write-Host "Deployment completed. Files in IIS: $($files.Count) (robocopy exit code: $robocopyExitCode)"
+
+
+      - name: Start App Pool
+        if: always()
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $pool = Get-WebAppPoolState -Name $env:APP_POOL_NAME -ErrorAction SilentlyContinue
+          if (-not $pool) {
+              Write-Error "App pool '$env:APP_POOL_NAME' was not found."
+              exit 1
+          }
+
+          if ($pool.Value -eq "Stopped") {
+              Start-WebAppPool -Name $env:APP_POOL_NAME
+              Start-Sleep -Seconds 3
+              Write-Host "App pool started."
+          } else {
+              Write-Host "App pool already running."
+          }
+
+
+      # Skipped automatically if HEALTH_CHECK_URL is left blank.
+      - name: Smoke Test
+        if: success() && env.HEALTH_CHECK_URL != ''
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+              try {
+                  $response = Invoke-WebRequest -Uri $env:HEALTH_CHECK_URL -UseBasicParsing -TimeoutSec 10
+                  if ($response.StatusCode -eq 200) {
+                      Write-Host "Smoke test passed on attempt $i."
+                      $ok = $true
+                      break
+                  }
+              } catch {
+                  Write-Host "Attempt $i failed: $($_.Exception.Message)"
+              }
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $ok) {
+              Write-Error "Smoke test failed after 5 attempts."
+              exit 1
+          }
+
+
+      # Only runs if something above failed AND a backup exists.
+      # Restores the previous version so a bad deploy doesn't stay live.
+      # Same robocopy exit-code fix applied here as in Deploy Web API.
+      - name: Rollback on Failure
+        if: failure() && env.BACKUP_SNAPSHOT_PATH != ''
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          Write-Host "Deploy failed - rolling back from $env:BACKUP_SNAPSHOT_PATH"
+
+          Stop-WebAppPool -Name $env:APP_POOL_NAME -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          robocopy $env:BACKUP_SNAPSHOT_PATH $env:IIS_PATH /MIR /R:3 /W:5 /NFL /NDL /NP
+          $robocopyExitCode = $LASTEXITCODE
+
+          if ($robocopyExitCode -ge 8) {
+              Write-Error "Rollback robocopy failed (exit code $robocopyExitCode)."
+              exit 1
+          }
+
+          $global:LASTEXITCODE = 0
+
+          Start-WebAppPool -Name $env:APP_POOL_NAME
+          Start-Sleep -Seconds 3
+          Write-Host "Rollback completed (robocopy exit code: $robocopyExitCode)."
+
+
+      - name: Verify App Pool
+        if: always()
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $pool = Get-WebAppPoolState -Name $env:APP_POOL_NAME -ErrorAction SilentlyContinue
+          Write-Host "App Pool State: $($pool.Value)"
+
+          if ($pool.Value -ne "Started") {
+              Write-Error "App pool '$env:APP_POOL_NAME' is not running."
+              exit 1
+          }
+
+
+      - name: Cleanup
+        if: always()
+        run: |
+          Remove-Item $env:DEPLOY_PATH -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Temporary deployment files removed."
