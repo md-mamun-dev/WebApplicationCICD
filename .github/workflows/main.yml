@@ -147,40 +147,40 @@ jobs:
   # ==================================================
   # DEPLOY
   # ==================================================
-  # deploy:
-  #   name: Deploy to IIS
+  deploy:
+    name: Deploy to IIS
 
-  #   needs: build
+    needs: build
 
-  #   runs-on:
-  #     - self-hosted
-  #     - Windows
+    runs-on:
+      - self-hosted
+      - Windows
 
-  #   timeout-minutes: 20
+    timeout-minutes: 20
 
-  #   defaults:
-  #     run:
-  #       shell: powershell
+    defaults:
+      run:
+        shell: powershell
 
-  #   steps:
+    steps:
 
-  #     - name: Download Web API Artifact
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: ${{ env.ARTIFACT_NAME }}
-  #         path: ${{ env.DEPLOY_PATH }}
+      - name: Download Web API Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.DEPLOY_PATH }}
 
 
-  #     - name: Verify Artifact
-  #       run: |
-  #         $ErrorActionPreference = "Stop"
+      - name: Verify Artifact
+        run: |
+          $ErrorActionPreference = "Stop"
 
-  #         $files = Get-ChildItem -Path $env:DEPLOY_PATH -Recurse -File
-  #         if ($files.Count -eq 0) {
-  #             Write-Error "Artifact folder is empty: $env:DEPLOY_PATH"
-  #             exit 1
-  #         }
-  #         Write-Host "Downloaded files: $($files.Count)"
+          $files = Get-ChildItem -Path $env:DEPLOY_PATH -Recurse -File
+          if ($files.Count -eq 0) {
+              Write-Error "Artifact folder is empty: $env:DEPLOY_PATH"
+              exit 1
+          }
+          Write-Host "Downloaded files: $($files.Count)"
 
 
   #     - name: Stop App Pool
